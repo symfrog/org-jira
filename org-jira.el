@@ -765,6 +765,87 @@ With a prefix argument, allow you to customize the jql.  See
      (let ((issues (append (cdr (assoc 'issues (cl-getf data :data))) nil)))
        (org-jira-get-issues issues)))))
 
+(defun org-jira-insert-subtask (issue)
+  (let* ((issue-id (org-jira-get-issue-key issue))
+	 (issue-summary (org-jira-get-issue-summary issue))
+	 (issue-headline issue-summary))
+    (setq p (org-find-entry-with-id issue-id))
+    (save-restriction
+      (if (and p (>= p (point-min))
+	       (<= p (point-max)))
+	  (progn
+	    (goto-char p)
+	    (forward-thing 'whitespace)
+	    (kill-line))
+	(goto-char (point-max))
+	(unless (looking-at "^")
+	  (insert "\n"))
+	(insert "**** "))
+      (let ((status (org-jira-get-issue-val 'status issue)))
+	(org-jira-insert (concat (cond (org-jira-use-status-as-todo
+					(upcase (replace-regexp-in-string " " "-" status)))
+				       ((member status org-jira-done-states) "DONE")
+				       ("TODO")) " "
+				       issue-headline)))
+      (save-excursion
+	(unless (search-forward "\n" (point-max) 1)
+	  (insert "\n")))
+      (org-narrow-to-subtree)
+      (org-change-tag-in-region
+       (point-min)
+       (save-excursion
+	 (forward-line 1)
+	 (point))
+       (replace-regexp-in-string "-" "_" issue-id)
+       nil)
+
+      (mapc (lambda (entry)
+	      (let ((val (org-jira-get-issue-val entry issue)))
+		(when (or (and val (not (string= val "")))
+			  (eq entry 'assignee)) ;; Always show assignee
+		  (org-jira-entry-put (point) (symbol-name entry) val))))
+	    '(assignee reporter type priority resolution status components created updated))
+
+      (org-jira-entry-put (point) "ID" (org-jira-get-issue-key issue))
+      (org-jira-entry-put (point) "CUSTOM_ID" (org-jira-get-issue-key issue))
+
+      ;; Insert the duedate as a deadline if it exists
+      (when org-jira-deadline-duedate-sync-p
+	(let ((duedate (org-jira-get-issue-val 'duedate issue)))
+	  (when (> (length duedate) 0)
+	    (org-deadline nil duedate))))
+
+      (mapc (lambda (heading-entry)
+	      (ensure-on-issue-id
+	       issue-id
+	       (let* ((entry-heading (concat (symbol-name heading-entry) (format ": [[%s][%s]]" (concat jiralib-url "/browse/" issue-id) issue-id))))
+		 (setq p (org-find-exact-headline-in-buffer entry-heading))
+		 (if (and p (>= p (point-min))
+			  (<= p (point-max)))
+		     (progn
+		       (goto-char p)
+		       (org-narrow-to-subtree)
+		       (goto-char (point-min))
+		       (forward-line 1)
+		       (delete-region (point) (point-max)))
+		   (if (org-goto-first-child)
+		       (org-insert-heading)
+		     (goto-char (point-max))
+		     (org-insert-subheading t))
+		   (org-jira-insert entry-heading "\n"))
+
+		 ;;  Insert 2 spaces of indentation so Jira markup won't cause org-markup
+		 (org-jira-insert
+		  (replace-regexp-in-string "^" "  " (org-jira-get-issue-val heading-entry issue))))))
+	    '(description))
+      (org-jira-update-comments-for-current-issue 5)
+      ;; FIXME: Re-enable when attachments are not erroring.
+      ;;(org-jira-update-attachments-for-current-issue)
+
+      ;; only sync worklog clocks when the user sets it to be so.
+      (when org-jira-worklog-sync-p
+	(org-jira-update-worklogs-for-current-issue)))))
+
 ;;;###autoload
 (defun org-jira-get-issues (issues)
   "Get list of ISSUES into an org buffer.
@@ -870,8 +951,32 @@ See`org-jira-get-issue-list'"
                       (when org-jira-worklog-sync-p
                         (org-jira-update-worklogs-for-current-issue))
 
-                      ))))))
-          issues)
+		      (when (not (zerop (length (org-jira-find-value issue 'fields 'subtasks))))
+			(let* ((subtasks (jiralib-do-jql-search (format "parent = %s" (org-jira-parse-issue-id))))
+			       (subtask-heading (concat "subtasks" (format ": [[%s][%s]]" (concat jiralib-url "/browse/" issue-id) issue-id))))
+			  (ensure-on-issue-id
+			   issue-id 
+			   (setq p (org-find-exact-headline-in-buffer subtask-heading))
+			   (if (and p (>= p (point-min))
+				    (<= p (point-max)))
+			       (progn
+				 (goto-char p)
+				 (goto-char (point-min))
+				 (forward-line 1))
+			     (if (org-goto-first-child)
+				 (org-insert-heading)
+			       (goto-char (point-max))
+			       (org-insert-subheading t))
+			     (org-jira-insert subtask-heading "\n"))
+
+			   (org-narrow-to-subtree)
+
+			   (mapc (lambda (subtask)
+				   (org-jira-insert-subtask subtask))
+				 subtasks))))
+
+		      ))))))
+	  issues)
     (switch-to-buffer project-buffer)))
 
 ;;;###autoload
@@ -879,7 +984,7 @@ See`org-jira-get-issue-list'"
   "Update a comment for the current issue."
   (interactive)
   (let* ((issue-id (org-jira-get-from-org 'issue 'key))
-         (comment-id (org-jira-get-from-org 'comment 'id))
+	 (comment-id (org-jira-get-from-org 'comment 'id))
          (comment (replace-regexp-in-string "^  " "" (org-jira-get-comment-body comment-id)))
          (callback-edit
           (cl-function
@@ -1039,9 +1144,10 @@ Expects input in format such as: [2017-04-05 Wed 01:00]--[2017-04-05 Wed 01:46] 
 (defun org-jira-get-comment-author (comment)
   (org-jira-find-value comment 'author 'displayName))
 
-(defun org-jira-update-comments-for-current-issue ()
+(defun org-jira-update-comments-for-current-issue (&optional comment-depth)
   "Update the comments for the current issue."
-  (lexical-let ((issue-id (org-jira-get-from-org 'issue 'key)))
+  (lexical-let ((issue-id (org-jira-get-from-org 'issue 'key))
+		(cdepth comment-depth))
     ;; Run the call
     (jiralib-get-comments
      issue-id
@@ -1073,7 +1179,7 @@ Expects input in format such as: [2017-04-05 Wed 01:00]--[2017-04-05 Wed 01:46] 
                 (goto-char (point-max))
                 (unless (looking-at "^")
                   (insert "\n"))
-                (insert "*** ")
+                (insert (make-string (or cdepth 3) ?*) " ")
                 (org-jira-insert comment-headline "\n")
                 (org-narrow-to-subtree)
                 (org-jira-entry-put (point) "ID" comment-id)

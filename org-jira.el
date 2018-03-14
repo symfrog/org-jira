@@ -423,7 +423,7 @@ Entry to this mode calls the value of `org-jira-mode-hook'."
    org-jira-users
    (mapcar (lambda (user)
              (cons (cdr (assoc 'displayName user))
-                   (cdr (assoc 'key user))))
+                   (cdr (assoc 'name user))))
            (jiralib-get-users project-key))))
 
 (defun org-jira-entry-put (pom property value)
